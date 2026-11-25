@@ -1,0 +1,57 @@
+name: Build offline speech runtime
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/whisper-runtime.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Fetch pinned source
+        run: |
+          set -euo pipefail
+          git init -q upstream
+          git -C upstream fetch --depth=1 https://github.com/ggml-org/whisper.cpp.git a8d002cfd879315632a579e73f0148d06959de36
+          git -C upstream checkout --detach FETCH_HEAD
+          test "$(git -C upstream rev-parse HEAD)" = a8d002cfd879315632a579e73f0148d06959de36
+
+      - name: Build CPU CLI and download verified multilingual model
+        run: |
+          set -euo pipefail
+          cmake -S upstream -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF -DGGML_OPENMP=OFF -DWHISPER_BUILD_TESTS=OFF
+          cmake --build build --target whisper-cli --parallel 3
+          install -Dm755 build/bin/whisper-cli runtime/bin/whisper-cli
+          mkdir -p runtime/models runtime/licenses
+          curl --fail --show-error --silent --location --retry 3 https://huggingface.co/ggerganov/whisper.cpp/resolve/fb5ed9369c26eaf08392504d8446da431e0fffb9/ggml-base.bin -o runtime/models/ggml-base.bin
+          echo '60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe  runtime/models/ggml-base.bin' | sha256sum --check
+          cp upstream/LICENSE runtime/licenses/whisper.cpp.txt
+          curl --fail --show-error --silent --location --retry 3 https://raw.githubusercontent.com/openai/whisper/31243bad24cc746f07d4c8bfdd2d974872cb1803/LICENSE -o runtime/licenses/whisper.txt
+
+      - name: Verify real speech recognition and package
+        run: |
+          set -euo pipefail
+          runtime/bin/whisper-cli -m runtime/models/ggml-base.bin -l en -f upstream/samples/jfk.wav -oj -of smoke
+          python3 - <<'PY'
+          import json
+          with open("smoke.json") as stream:
+              text = " ".join(segment["text"] for segment in json.load(stream)["transcription"])
+          assert "your country" in text.lower(), text
+          PY
+          (cd runtime && sha256sum bin/whisper-cli models/ggml-base.bin > SHA256SUMS)
+          tar -C runtime -cf runtime.tar bin models licenses SHA256SUMS
+
+      - name: Store offline runtime
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: whisper-runtime-linux-x86_64
+          path: runtime.tar
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
